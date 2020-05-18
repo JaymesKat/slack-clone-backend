@@ -1,0 +1,18 @@
+{
+    "$schema": "http://json-schema.org/draft-04/schema#",
+    "title": "channel",
+    "type": "object",
+    "properties": {
+      "name": {
+        "type": "string"
+      },
+      "createdBy": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "name",
+      "createdBy"
+    ],
+    "additionalProperties": false
+  }

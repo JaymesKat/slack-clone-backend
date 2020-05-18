@@ -1,0 +1,617 @@
+service: slack-backend
+
+plugins:
+  - serverless-webpack
+  - serverless-aws-documentation
+  - serverless-dynamodb-local
+  - serverless-offline
+  - serverless-iam-roles-per-function
+  - serverless-dotenv-plugin
+
+provider:
+  name: aws
+  runtime: nodejs12.x
+
+  stage: ${opt:stage, 'dev'}
+  region: ${opt:region, 'us-east-1'}
+  profile: ${env:AWS_PROFILE}
+
+  environment:
+    JWKS_ENDPOINT: https://reactauth0-test.auth0.com/.well-known/jwks.json
+    IMAGES_BUCKET: slack-images-${self:provider.stage}
+    SIGNED_URL_EXPIRATION: 300
+    USERS_TABLE: Users-${self:provider.stage}
+    USERS_INDEX: Users-index
+    USERS_INDEX2: Users-Index2
+    MESSAGES_TABLE: Messages-${self:provider.stage}
+    MESSAGES_INDEX: Messages-Index
+    CHANNELS_TABLE: Channels-${self:provider.stage}
+    MEMBERSHIPS_TABLE: Membership-${self:provider.stage}
+    MEMBERSHIPS_INDEX: Memberships-Index
+    MEMBERSHIPS_INDEX_2: Memberships-Index_2
+    CONNECTIONS_TABLE: Client-connections-${self:provider.stage}
+
+  websocketsApiName: Websockets-Api
+  websocketsApiRouteSelectionExpression: $request.body.action
+
+  tracing:
+    lambda: true
+    apiGateway: true
+
+  logs:
+    websocket: true
+    restApi: true
+
+  iamRoleStatements:
+    - Effect: "Allow"
+      Action:
+        - xray:PutTelemetryRecords
+        - xray:PutTraceSegments
+      Resource: "*"
+
+custom:
+  webpack:
+    webpackConfig: ./webpack.config.js
+    includeModules: true
+
+  documentation:
+    api:
+      info:
+        version: v1.0.0
+        title: Slack Clone API
+        description: Serverless application for Slack Clone API
+    models:
+      - name: ChannelRequest
+        contentType: application/json
+        schema: ${file(src/requests/create-channel-request.json)}
+      - name: MembershipRequest
+        contentType: application/json
+        schema: ${file(src/requests/create-membership-request.json)}
+      - name: UserProfileRequest
+        contentType: application/json
+        schema: ${file(src/requests/create-user-profile-request.json)}
+
+  serverless-iam-roles-per-function:
+    defaultInherit: true
+
+  serverless-offline:
+    babelOptions:
+      presets: ["es2015"]
+
+  dynamodb:
+    start:
+      port: 8000
+      inMemory: true
+      migrate: true
+    stages:
+      - dev
+
+functions:
+  Auth:
+    handler: src/lambda/auth/auth0Authorizer.handler
+
+  ConnectionManager:
+    handler: src/lambda/websockets/ConnectionManager.handler
+    events:
+      - websocket:
+          route: $connect
+          cors: true
+      - websocket:
+          route: $disconnect
+          cors: true
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:PutItem
+          - dynamodb:DeleteItem
+        Resource:
+          - Fn::GetAtt: [ConnectionsDynamoDBTable, Arn]
+
+  DefaultHandler:
+    handler: src/lambda/websockets/DefaultMessage.handler
+    events:
+      - websocket:
+          route: $default
+          cors: true
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - "execute-api:ManageConnections"
+        Resource:
+          - "arn:aws:execute-api:${self:provider.region}:*:**/@connections/*"
+
+  SendMessage:
+    handler: src/lambda/websockets/SendMessage.handler
+    events:
+      - websocket:
+          route: sendMessage
+          cors: true
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:Scan
+          - dynamodb:Query
+        Resource:
+          - Fn::GetAtt: [ConnectionsDynamoDBTable, Arn]
+      - Effect: Allow
+        Action:
+          - dynamodb:GetItem
+        Resource:
+          - Fn::GetAtt: [UsersDynamoDBTable, Arn]
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.USERS_TABLE}/index/${self:provider.environment.USERS_INDEX}
+      - Effect: Allow
+        Action:
+          - dynamodb:PutItem
+        Resource:
+          - Fn::GetAtt: [MessagesDynamoDBTable, Arn]
+      - Effect: Allow
+        Action:
+          - "execute-api:ManageConnections"
+        Resource:
+          - "arn:aws:execute-api:${self:provider.region}:*:**/@connections/*"
+
+  GetS3UploadUrl:
+    handler: src/lambda/http/GetImageUploadUrl.handler
+    events:
+      - http:
+          method: get
+          path: imageUrl/{key}
+          cors: true
+          authorizer: Auth
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - s3:GetObject
+          - s3:PutObject
+        Resource: arn:aws:s3:::${self:provider.environment.IMAGES_BUCKET}/*
+
+  GetProfile:
+    handler: src/lambda/http/GetUserProfile.handler
+    events:
+      - http:
+          method: get
+          path: users/profile
+          cors: true
+          authorizer: Auth
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource:
+          - Fn::GetAtt: [UsersDynamoDBTable, Arn]
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.USERS_TABLE}/index/${self:provider.environment.USERS_INDEX}
+
+  CreateUserProfile:
+    handler: src/lambda/http/CreateUserProfile.handler
+    events:
+      - http:
+          method: post
+          path: users/profile
+          cors: true
+          authorizer: Auth
+          reqValidatorName: RequestBodyValidator
+          documentation:
+            summary: Create a user profile
+            description: Create user profile
+            requestModels:
+              "application/json": UserProfileRequest
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:PutItem
+        Resource:
+          - Fn::GetAtt: [UsersDynamoDBTable, Arn]
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.USERS_TABLE}/index/${self:provider.environment.USERS_INDEX}
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.USERS_TABLE}/index/${self:provider.environment.USERS_INDEX2}
+
+  GetUsers:
+    handler: src/lambda/http/GetUsers.handler
+    events:
+      - http:
+          method: get
+          path: users
+          cors: true
+          authorizer: Auth
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource:
+          - Fn::GetAtt: [UsersDynamoDBTable, Arn]
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.USERS_TABLE}/index/${self:provider.environment.USERS_INDEX2}
+
+  GetUserChannels:
+    handler: src/lambda/http/GetUserChannels.handler
+    events:
+      - http:
+          method: get
+          path: users/{userId}/channels
+          cors: true
+          authorizer: Auth
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource:
+          - Fn::GetAtt: [MembershipsDynamoDBTable, Arn]
+      - Effect: Allow
+        Action:
+          - dynamodb:BatchGetItem
+        Resource:
+          - Fn::GetAtt: [ChannelsDynamoDBTable, Arn]
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.MEMBERSHIPS_TABLE}/index/${self:provider.environment.MEMBERSHIPS_INDEX}
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.MEMBERSHIPS_TABLE}/index/${self:provider.environment.MEMBERSHIPS_INDEX_2}
+
+  CreateChannel:
+    handler: src/lambda/http/CreateChannel.handler
+    events:
+      - http:
+          method: post
+          path: channels
+          cors: true
+          authorizer: Auth
+          reqValidatorName: RequestBodyValidator
+          documentation:
+            summary: Create a new channel
+            description: Create a new channel
+            requestModels:
+              "application/json": ChannelRequest
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:PutItem
+        Resource:
+          - Fn::GetAtt: [ChannelsDynamoDBTable, Arn]
+      - Effect: Allow
+        Action:
+          - dynamodb:PutItem
+        Resource:
+          - Fn::GetAtt: [MembershipsDynamoDBTable, Arn]
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.MEMBERSHIPS_TABLE}/index/${self:provider.environment.MEMBERSHIPS_INDEX}
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.MEMBERSHIPS_TABLE}/index/${self:provider.environment.MEMBERSHIPS_INDEX_2}
+
+  JoinChannel:
+    handler: src/lambda/http/JoinChannel.handler
+    events:
+      - http:
+          method: post
+          path: channels/{channelId}/join
+          cors: true
+          authorizer: Auth
+          reqValidatorName: RequestBodyValidator
+          documentation:
+            summary: Join a channel
+            description: Join a channel
+            requestModels:
+              "application/json": MembershipRequest
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:GetItem
+        Resource:
+          - Fn::GetAtt: [ChannelsDynamoDBTable, Arn]
+      - Effect: Allow
+        Action:
+          - dynamodb:PutItem
+        Resource:
+          - Fn::GetAtt: [MembershipsDynamoDBTable, Arn]
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.MEMBERSHIPS_TABLE}/index/${self:provider.environment.MEMBERSHIPS_INDEX}
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.MEMBERSHIPS_TABLE}/index/${self:provider.environment.MEMBERSHIPS_INDEX_2}
+
+  GetAllChannels:
+    handler: src/lambda/http/GetAllChannels.handler
+    events:
+      - http:
+          method: get
+          path: channels
+          cors: true
+          authorizer: Auth
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:Scan
+        Resource:
+          - Fn::GetAtt: [ChannelsDynamoDBTable, Arn]
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource:
+          - Fn::GetAtt: [MembershipsDynamoDBTable, Arn]
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.MEMBERSHIPS_TABLE}/index/${self:provider.environment.MEMBERSHIPS_INDEX}
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.MEMBERSHIPS_TABLE}/index/${self:provider.environment.MEMBERSHIPS_INDEX_2}
+
+  GetUserDirectMessages:
+    handler: src/lambda/http/GetUserDirectMessages.handler
+    events:
+      - http:
+          method: get
+          path: users/{userId}/directmessages
+          cors: true
+          authorizer: Auth
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:BatchGetItem
+        Resource:
+          - Fn::GetAtt: [ChannelsDynamoDBTable, Arn]
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource:
+          - Fn::GetAtt: [MembershipsDynamoDBTable, Arn]
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.MESSAGES_TABLE}/index/${self:provider.environment.MESSAGES_INDEX}
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.MEMBERSHIPS_TABLE}/index/${self:provider.environment.MEMBERSHIPS_INDEX}
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.MEMBERSHIPS_TABLE}/index/${self:provider.environment.MEMBERSHIPS_INDEX_2}
+
+  GetChannelMessages:
+    handler: src/lambda/http/GetChannelMessages.handler
+    events:
+      - http:
+          method: get
+          path: channels/{channelId}/messages
+          cors: true
+          authorizer: Auth
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource:
+          - Fn::GetAtt: [MessagesDynamoDBTable, Arn]
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.MESSAGES_TABLE}/index/${self:provider.environment.MESSAGES_INDEX}
+
+  EditMessage:
+    handler: src/lambda/http/EditMessage.handler
+    events:
+      - http:
+          method: put
+          path: channels/{channelId}/messages/{messageId}
+          cors: true
+          authorizer: Auth
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+          - dynamodb:PutItem
+        Resource:
+          - Fn::GetAtt: [MessagesDynamoDBTable, Arn]
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.MESSAGES_TABLE}/index/${self:provider.environment.MESSAGES_INDEX}
+
+  DeleteMessage:
+    handler: src/lambda/http/DeleteMessage.handler
+    events:
+      - http:
+          method: delete
+          path: channels/{channelId}/messages/{messageId}
+          cors: true
+          authorizer: Auth
+    iamRoleStatements:
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+          - dynamodb:DeleteItem
+        Resource:
+          - Fn::GetAtt: [MessagesDynamoDBTable, Arn]
+      - Effect: Allow
+        Action:
+          - dynamodb:Query
+        Resource: arn:aws:dynamodb:${self:provider.region}:*:table/${self:provider.environment.MESSAGES_TABLE}/index/${self:provider.environment.MESSAGES_INDEX}
+
+resources:
+  Resources:
+    RequestBodyValidator:
+      Type: AWS::ApiGateway::RequestValidator
+      Properties:
+        Name: "request-body-validator"
+        RestApiId:
+          Ref: ApiGatewayRestApi
+        ValidateRequestBody: true
+        ValidateRequestParameters: false
+
+    ConnectionsDynamoDBTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        AttributeDefinitions:
+          - AttributeName: id
+            AttributeType: S
+        KeySchema:
+          - AttributeName: id
+            KeyType: HASH
+        BillingMode: PAY_PER_REQUEST
+        TableName: ${self:provider.environment.CONNECTIONS_TABLE}
+
+    UsersDynamoDBTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        AttributeDefinitions:
+          - AttributeName: id
+            AttributeType: S
+          - AttributeName: authId
+            AttributeType: S
+          - AttributeName: status
+            AttributeType: S
+        KeySchema:
+          - AttributeName: id
+            KeyType: HASH
+        BillingMode: PAY_PER_REQUEST
+        TableName: ${self:provider.environment.USERS_TABLE}
+        GlobalSecondaryIndexes:
+          - IndexName: ${self:provider.environment.USERS_INDEX}
+            KeySchema:
+              - AttributeName: authId
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+          - IndexName: ${self:provider.environment.USERS_INDEX2}
+            KeySchema:
+              - AttributeName: status
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+
+    MessagesDynamoDBTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        AttributeDefinitions:
+          - AttributeName: messageId
+            AttributeType: S
+          - AttributeName: channelId
+            AttributeType: S
+          - AttributeName: createdAt
+            AttributeType: S
+        KeySchema:
+          - AttributeName: channelId
+            KeyType: HASH
+          - AttributeName: createdAt
+            KeyType: RANGE
+        BillingMode: PAY_PER_REQUEST
+        TableName: ${self:provider.environment.MESSAGES_TABLE}
+        GlobalSecondaryIndexes:
+          - IndexName: ${self:provider.environment.MESSAGES_INDEX}
+            KeySchema:
+              - AttributeName: messageId
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+
+    ChannelsDynamoDBTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        AttributeDefinitions:
+          - AttributeName: id
+            AttributeType: S
+          - AttributeName: createdAt
+            AttributeType: S
+        KeySchema:
+          - AttributeName: id
+            KeyType: HASH
+        BillingMode: PAY_PER_REQUEST
+        TableName: ${self:provider.environment.CHANNELS_TABLE}
+
+
+    MembershipsDynamoDBTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        AttributeDefinitions:
+          - AttributeName: membershipId
+            AttributeType: S
+          - AttributeName: userId
+            AttributeType: S
+          - AttributeName: channelId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: membershipId
+            KeyType: HASH
+          - AttributeName: channelId
+            KeyType: RANGE
+        BillingMode: PAY_PER_REQUEST
+        TableName: ${self:provider.environment.MEMBERSHIPS_TABLE}
+        GlobalSecondaryIndexes:
+          - IndexName: ${self:provider.environment.MEMBERSHIPS_INDEX}
+            KeySchema:
+              - AttributeName: userId
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+          - IndexName: ${self:provider.environment.MEMBERSHIPS_INDEX_2}
+            KeySchema:
+              - AttributeName: channelId
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+
+    ImagesBucket:
+      Type: AWS::S3::Bucket
+      Properties:
+        BucketName: ${self:provider.environment.IMAGES_BUCKET}
+        CorsConfiguration:
+          CorsRules:
+            - AllowedOrigins:
+                - "*"
+              AllowedHeaders:
+                - "*"
+              AllowedMethods:
+                - GET
+                - PUT
+                - POST
+                - DELETE
+                - HEAD
+              MaxAge: 3000
+
+    BucketPolicy:
+      Type: AWS::S3::BucketPolicy
+      Properties:
+        PolicyDocument:
+          Id: MyBucketPolicy
+          Version: "2012-10-17"
+          Statement:
+            - Sid: PublicReadForGetBucketObjects
+              Effect: Allow
+              Principal: "*"
+              Action: "s3:GetObject"
+              Resource: "arn:aws:s3:::${self:provider.environment.IMAGES_BUCKET}/*"
+        Bucket: !Ref ImagesBucket
+
+    GatewayResponseDefault4XX:
+      Type: AWS::ApiGateway::GatewayResponse
+      Properties:
+        ResponseParameters:
+          gatewayresponse.header.Access-Control-Allow-Origin: "'*'"
+          gatewayresponse.header.Access-Control-Allow-Headers: "'Content-Type,X-Amz-Date,Authorization,X-Api-Key,X-Amz-Security-Token'"
+          gatewayresponse.header.Access-Control-Allow-Methods: "'GET,OPTIONS,POST'"
+        ResponseType: DEFAULT_4XX
+        RestApiId:
+          Ref: ApiGatewayRestApi

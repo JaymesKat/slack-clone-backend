@@ -1,0 +1,18 @@
+{
+    "$schema": "http://json-schema.org/draft-04/schema#",
+    "title": "membership",
+    "type": "object",
+    "properties": {
+      "userId": {
+        "type": "string"
+      },
+      "channelId": {
+        "type": "string"
+      }
+    },
+    "required": [
+      "name",
+      "channelId"
+    ],
+    "additionalProperties": false
+  }
